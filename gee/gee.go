@@ -5,7 +5,7 @@ import (
 	"net/http"
 )
 
-type HandlerFunc func(http.ResponseWriter, *http.Request)
+type HandlerFunc func(* Context)
 
 type Engine struct {
 	Route map[string]HandlerFunc
@@ -34,8 +34,9 @@ func (e *Engine) Run(addr string) (err error) {
 
 func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request){
   key := req.Method + "-" + req.URL.Path
+  c := newContext(w, req)
   if handler, ok := e.Route[key]; ok {
-		handler(w, req)
+		handler(c)
 	} else {
 		fmt.Fprintf(w, "404 NOT FOUND: %s\n", req.URL)
 	}

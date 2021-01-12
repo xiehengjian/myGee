@@ -297,4 +297,243 @@ func main() {
 
 
 
+## 为什么需要Context
+
+在使用`net/http`进行Web编程时，构造完整的响应需要写大量繁琐重复的代码，为了提高效率，我们可以将HTTP传输的内容封装到一个`Context`中，并为其实现一些常用的方法。
+
+首先将请求与响应封装到`Context`中
+
+```golang
+type Context struct{
+	Writer http.ResponseWriter
+	Req    *http.Request
+}
+```
+
+至此我们可以将handler函数写成如下形式了
+
+```go
+type HandlerFunc func(c *Context)
+```
+
+当最终`ServeHTTP()`处理请求时，将其接受的`	http.ResponseWriter  `与`*http.Request`构造成一个`Context`,然后再调用`Route`中保存的用户编写的handler函数即可
+
+```go
+func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request){
+  key := req.Method + "-" + req.URL.Path
+  c := newContext(w, req)
+  if handler, ok := e.Route[key]; ok {
+		handler(c)
+	} else {
+		fmt.Fprintf(w, "404 NOT FOUND: %s\n", req.URL)
+	}
+}
+```
+
+## 封装一些常用的功能
+
+为了方便处理http传输的信息，我们先对`Context`进行扩充
+
+```go
+type Context struct {
+	Writer http.ResponseWriter
+	Req    *http.Request
+	Path   string
+	Method string
+	StatusCode int
+}
+```
+
+为`Context`实现构造器
+
+```go
+func newContext(w http.ResponseWriter, req *http.Request) *Context {
+	return &Context{
+		Writer: w,
+		Req:    req,
+		Path:   req.URL.Path,
+		Method: req.Method,
+	}
+}
+```
+
+封装一个设置HEAD的方法
+
+```go
+func (c *Context)SetHead(key string,value string){
+  c.Writer.Head().Set(key,value)
+}
+```
+
+封装一个返回字符串的方法
+
+```go
+func (c *Context) String(code int, format string, values ...interface{}) {
+	c.SetHeader("Content-Type", "text/plain")
+	c.Status(code)
+	c.Writer.Write([]byte(fmt.Sprintf(format, values...)))
+}
+```
+
+封装一个返回JSON数据的方法
+
+```go
+func (c *Context) JSON(code int, obj interface{}) {
+	c.SetHeader("Content-Type", "application/json")
+	c.Status(code)
+	encoder := json.NewEncoder(c.Writer)
+	if err := encoder.Encode(obj); err != nil {
+		http.Error(c.Writer, err.Error(), 500)
+	}
+}
+```
+
+封装一个返回HTML数据的方法
+
+```go
+func (c *Context) HTML(code int, html string) {
+	c.SetHeader("Content-Type", "text/html")
+	c.Status(code)
+	c.Writer.Write([]byte(html))
+}
+```
+
+至此，我们已经实现了`Context`的定义和相关方法的实现，我们将其单独放到`context.go`中。
+
+## Web框架1.1
+
+`context.go`
+
+```go
+package gee 
+
+import (
+	"net/http"
+	"fmt"
+	"encoding/json"
+
+)
+type Context struct {
+	Writer http.ResponseWriter
+	Req    *http.Request
+	Path   string
+	Method string
+	StatusCode int
+}
+
+func newContext(w http.ResponseWriter, req *http.Request) *Context {
+	return &Context{
+		Writer: w,
+		Req:    req,
+		Path:   req.URL.Path,
+		Method: req.Method,
+	}
+}
+
+func (c *Context) Status(code int) {
+	c.StatusCode = code
+	c.Writer.WriteHeader(code)
+}
+func (c *Context)SetHeader(key string,value string){
+	c.Writer.Header().Set(key,value)
+  }
+
+  func (c *Context) String(code int, format string, values ...interface{}) {
+	c.SetHeader("Content-Type", "text/plain")
+	c.Status(code)
+	c.Writer.Write([]byte(fmt.Sprintf(format, values...)))
+}
+
+func (c *Context) JSON(code int, obj interface{}) {
+	c.SetHeader("Content-Type", "application/json")
+	c.Status(code)
+	encoder := json.NewEncoder(c.Writer)
+	if err := encoder.Encode(obj); err != nil {
+		http.Error(c.Writer, err.Error(), 500)
+	}
+}
+
+func (c *Context) HTML(code int, html string) {
+	c.SetHeader("Content-Type", "text/html")
+	c.Status(code)
+	c.Writer.Write([]byte(html))
+}
+```
+
+`gee.go`
+
+```go
+package gee
+
+import (
+	"fmt"
+	"net/http"
+)
+
+type HandlerFunc func(* Context)
+
+type Engine struct {
+	Route map[string]HandlerFunc
+}
+
+//实现一个构造器以便用户创建框架实例
+func New() *Engine{
+  return &Engine{Route:make(map[string]HandlerFunc)}
+}
+
+//实现一个GET方法可以处理GET请求
+func (e *Engine) GET(pattern string,handler HandlerFunc){
+  key := "GET" + "-" + pattern
+	e.Route[key] = handler
+}
+
+//实现一个POST方法可以处理POST请求
+func (e *Engine)POST(pattern string,handler HandlerFunc){
+  key:= "POST" + "-" + pattern
+  e.Route[key]=handler
+}
+
+func (e *Engine) Run(addr string) (err error) {
+	return http.ListenAndServe(addr, e)
+}
+
+func (e *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request){
+  key := req.Method + "-" + req.URL.Path
+  c := newContext(w, req)
+  if handler, ok := e.Route[key]; ok {
+		handler(c)
+	} else {
+		fmt.Fprintf(w, "404 NOT FOUND: %s\n", req.URL)
+	}
+}
+```
+
+`main.go`
+
+```go
+package main
+
+import (
+	"fmt"
+	"./gee"
+)
+
+func main() {
+	r := gee.New()
+	r.GET("/", func(c *gee.Context) {
+		fmt.Fprintf(c.Writer, "URL.Path = %q\n", c.Path)
+	})
+
+	r.GET("/hello", func(c *gee.Context) {
+		for k, v := range c.Req.Header {
+			fmt.Fprintf(c.Writer, "Header[%q] = %q\n", k, v)
+		}
+	})
+
+	r.Run(":8080")
+}
+```
+
+
+
 
