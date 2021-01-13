@@ -534,6 +534,580 @@ func main() {
 }
 ```
 
+## 更高级的路由
+
+对于一个Web框架来说，支持动态路由是一个基本的功能，因此我们的框架也需要实现动态路由的功能。在此之前我们的路由表设计成了哈希表，可以非常高效的进行路由匹配，但是在匹配动态路由时需要进行逐步的查找与搜索，那么哈希表则不太适用了。
+
+目前我们计划设计支持两种模式的动态路由，`:name`和`*filepath`
+
+因此我们采用一种叫做`Trie`树的数据结构，也称为前缀树或字典树。
+
+> 在计算机科学中，trie，又称前缀树或字典树，是一种有序树，用于保存关联数组，其中的键通常是字符串。与二叉查找树不同，键不是直接保存在节点中，而是由节点在树中的位置决定。一个节点的所有子孙都有相同的前缀，也就是这个节点对应的字符串，而根节点对应空字符串。一般情况下，不是所有的节点都有对应的值，只有叶子节点和部分内部节点所对应的键才有相关的值。
+>
+> trie中的键通常是字符串，但也可以是其它的结构。trie的算法可以很容易地修改为处理其它结构的有序序列，比如一串数字或者形状的排列。比如，bitwise trie中的键是一串位元，可以用于表示整数或者内存地址
+
+首先我们设计的Trie树的结构如下
+
+```go
+type node struct{
+  pattern string  //待匹配的路由
+  part string 	//匹配部分
+  children []*node //子节点
+  isWild bool  //是否是通配符，为true时说明当前结点为通配结点
+}
+```
+
+由于`Route`不再使用简单的哈希表作为底层数据结构，因此我们需要重新设计一下`Route`
+
+```go
+type Route struct{
+  roots    map[string]*node//为每一种http方法构建一颗trie树
+	handlers map[string]HandlerFunc
+}
+// roots key eg, roots['GET'] roots['POST']
+// handlers key eg, handlers['GET-/p/:lang/doc'], handlers['POST-/p/book']
+```
 
 
+
+接下来我们需要解决的是路由规则的注册，对于用户提供的动态路由模板，如何将其插入到路由表中。
+
+首先我们抽象出一个独立的添加路由的方法`addRoute()`
+
+```go
+func (r *router) addRoute(method string, pattern string, handler HandlerFunc) {
+  parts := parsePattern(pattern)//将路由分解，如/index/:id拆分成["index",":id"]
+
+	key := method + "-" + pattern
+  //构建不同HTTP方法的trie树
+	_, ok := r.roots[method]
+	if !ok {
+		r.roots[method] = &node{}
+	}
+  //将该路由插入trie树中
+	r.roots[method].insert(pattern, parts, 0)
+  //绑定处理函数
+	r.handlers[key] = handler
+}
+```
+
+那么我们就需要实现一下插入的算法
+
+```go
+func (n *node) insert(pattern string, parts []string, height int) {
+  //pattern为完整路由
+  //parts为路径数组
+  //height为路径数组索引
+  
+  //插入终止条件，即遍历完所有路径
+	if len(parts) == height {
+		n.pattern = pattern
+		return
+	}
+	
+  //取出当前需要插入的字符
+	part := parts[height]
+  //在当前节点的子结点中寻找该part
+	child := n.matchChild(part)
+  //如果找不到，就新建一个
+	if child == nil {
+		child = &node{part: part, isWild: part[0] == ':' || part[0] == '*'}
+		n.children = append(n.children, child)
+	}
+  //递归的在子结点中插入剩下的部分
+	child.insert(pattern, parts, height+1)
+}
+
+```
+
+然后我们再来实现匹配的算法
+
+```go
+// 第一个匹配成功的节点，用于插入
+func (n *node) matchChild(part string) *node {
+  //遍历所有子结点
+	for _, child := range n.children {
+    //如果该子结点的part与匹配的相同
+    //如果该子结点是通配结点
+		if child.part == part || child.isWild {
+			return child
+		}
+	}
+	return nil
+}
+```
+
+那么至此用户注册路由的方法就实现了.
+
+接下来我们还需要实现对于请求路由的动态匹配问题了。
+
+```go
+func (r *router) getRoute(method string, path string) (*node, map[string]string) {
+  //将路由分解，如/index/:id拆分成["index",":id"]
+	searchParts := parsePattern(path)
+  //构建路由变量与实际请求的映射
+	params := make(map[string]string)
+  //如果当前HTTP方法不存在路由树，说明不存在该路由，直接返回nil
+	root, ok := r.roots[method]
+
+	if !ok {
+		return nil, nil
+	}
+  
+	//寻找到匹配的路由对应的trie结点，则n.pattern则为用户注册的路由
+	n := root.search(searchParts, 0)
+
+  //n不为空，即找到了对应的trie结点
+	if n != nil {
+    //对用户注册的路由进行拆分
+		parts := parsePattern(n.pattern)
+    //遍历路由的各个路径项
+		for index, part := range parts {
+      //如果该路径为通配路径
+			if part[0] == ':' {
+        //params["name"]="jack"
+				params[part[1:]] = searchParts[index]
+			}
+			if part[0] == '*' && len(part) > 1 {
+        //params["filepath"]=""
+				params[part[1:]] = strings.Join(searchParts[index:], "/")
+				break
+			}
+		}
+		return n, params
+	}
+
+	return nil, nil
+}
+```
+
+然后实现`search()`
+
+```go
+func (n *node) search(parts []string, height int) *node {
+  //当搜索到最后一个part
+  //当前trie结点是*通配结点
+	if len(parts) == height || strings.HasPrefix(n.part, "*") {
+		if n.pattern == "" {
+			return nil
+		}
+		return n
+	}
+
+  //获取当前需要匹配的part
+	part := parts[height]
+  //搜索包含该part的所有子结点
+	children := n.matchChildren(part)
+	//遍历子结点集合，继续往下搜索
+	for _, child := range children {
+		result := child.search(parts, height+1)
+		if result != nil {
+			return result
+		}
+	}
+
+	return nil
+}
+```
+
+```go
+// 所有匹配成功的节点，用于查找
+func (n *node) matchChildren(part string) []*node {
+	nodes := make([]*node, 0)
+	for _, child := range n.children {
+		if child.part == part || child.isWild {
+			nodes = append(nodes, child)
+		}
+	}
+	return nodes
+}
+```
+
+至此我们就完整的实现了动态路由的功能了。
+
+## Web框架1.2
+
+`trie.go`
+
+```go
+package gee
+
+import (
+	"fmt"
+	"strings"
+)
+
+type node struct {
+	pattern  string
+	part     string
+	children []*node
+	isWild   bool
+}
+
+func (n *node) String() string {
+	return fmt.Sprintf("node{pattern=%s, part=%s, isWild=%t}", n.pattern, n.part, n.isWild)
+}
+
+func (n *node) insert(pattern string, parts []string, height int) {
+	if len(parts) == height {
+		n.pattern = pattern
+		return
+	}
+
+	part := parts[height]
+	child := n.matchChild(part)
+	if child == nil {
+		child = &node{part: part, isWild: part[0] == ':' || part[0] == '*'}
+		n.children = append(n.children, child)
+	}
+	child.insert(pattern, parts, height+1)
+}
+
+func (n *node) search(parts []string, height int) *node {
+	if len(parts) == height || strings.HasPrefix(n.part, "*") {
+		if n.pattern == "" {
+			return nil
+		}
+		return n
+	}
+
+	part := parts[height]
+	children := n.matchChildren(part)
+
+	for _, child := range children {
+		result := child.search(parts, height+1)
+		if result != nil {
+			return result
+		}
+	}
+
+	return nil
+}
+
+func (n *node) travel(list *([]*node)) {
+	if n.pattern != "" {
+		*list = append(*list, n)
+	}
+	for _, child := range n.children {
+		child.travel(list)
+	}
+}
+
+func (n *node) matchChild(part string) *node {
+	for _, child := range n.children {
+		if child.part == part || child.isWild {
+			return child
+		}
+	}
+	return nil
+}
+
+func (n *node) matchChildren(part string) []*node {
+	nodes := make([]*node, 0)
+	for _, child := range n.children {
+		if child.part == part || child.isWild {
+			nodes = append(nodes, child)
+		}
+	}
+	return nodes
+}
+
+```
+
+`route.go`
+
+```go
+package gee
+
+import (
+	"net/http"
+	"strings"
+)
+
+type router struct {
+	roots    map[string]*node
+	handlers map[string]HandlerFunc
+}
+
+func newRouter() *router {
+	return &router{
+		roots:    make(map[string]*node),
+		handlers: make(map[string]HandlerFunc),
+	}
+}
+
+// Only one * is allowed
+func parsePattern(pattern string) []string {
+	vs := strings.Split(pattern, "/")
+
+	parts := make([]string, 0)
+	for _, item := range vs {
+		if item != "" {
+			parts = append(parts, item)
+			if item[0] == '*' {
+				break
+			}
+		}
+	}
+	return parts
+}
+
+func (r *router) addRoute(method string, pattern string, handler HandlerFunc) {
+	parts := parsePattern(pattern)
+
+	key := method + "-" + pattern
+	_, ok := r.roots[method]
+	if !ok {
+		r.roots[method] = &node{}
+	}
+	r.roots[method].insert(pattern, parts, 0)
+	r.handlers[key] = handler
+}
+
+func (r *router) getRoute(method string, path string) (*node, map[string]string) {
+	searchParts := parsePattern(path)
+	params := make(map[string]string)
+	root, ok := r.roots[method]
+
+	if !ok {
+		return nil, nil
+	}
+
+	n := root.search(searchParts, 0)
+
+	if n != nil {
+		parts := parsePattern(n.pattern)
+		for index, part := range parts {
+			if part[0] == ':' {
+				params[part[1:]] = searchParts[index]
+			}
+			if part[0] == '*' && len(part) > 1 {
+				params[part[1:]] = strings.Join(searchParts[index:], "/")
+				break
+			}
+		}
+		return n, params
+	}
+
+	return nil, nil
+}
+
+func (r *router) getRoutes(method string) []*node {
+	root, ok := r.roots[method]
+	if !ok {
+		return nil
+	}
+	nodes := make([]*node, 0)
+	root.travel(&nodes)
+	return nodes
+}
+
+func (r *router) handle(c *Context) {
+	n, params := r.getRoute(c.Method, c.Path)
+	if n != nil {
+		c.Params = params
+		key := c.Method + "-" + n.pattern
+		r.handlers[key](c)
+	} else {
+		c.String(http.StatusNotFound, "404 NOT FOUND: %s\n", c.Path)
+	}
+}
+
+```
+
+`context.go`
+
+```go
+package gee
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+)
+
+type H map[string]interface{}
+
+type Context struct {
+	// origin objects
+	Writer http.ResponseWriter
+	Req    *http.Request
+	// request info
+	Path   string
+	Method string
+	Params map[string]string
+	// response info
+	StatusCode int
+}
+
+func newContext(w http.ResponseWriter, req *http.Request) *Context {
+	return &Context{
+		Writer: w,
+		Req:    req,
+		Path:   req.URL.Path,
+		Method: req.Method,
+	}
+}
+
+func (c *Context) Param(key string) string {
+	value, _ := c.Params[key]
+	return value
+}
+
+func (c *Context) PostForm(key string) string {
+	return c.Req.FormValue(key)
+}
+
+func (c *Context) Query(key string) string {
+	return c.Req.URL.Query().Get(key)
+}
+
+func (c *Context) Status(code int) {
+	c.StatusCode = code
+	c.Writer.WriteHeader(code)
+}
+
+func (c *Context) SetHeader(key string, value string) {
+	c.Writer.Header().Set(key, value)
+}
+
+func (c *Context) String(code int, format string, values ...interface{}) {
+	c.SetHeader("Content-Type", "text/plain")
+	c.Status(code)
+	c.Writer.Write([]byte(fmt.Sprintf(format, values...)))
+}
+
+func (c *Context) JSON(code int, obj interface{}) {
+	c.SetHeader("Content-Type", "application/json")
+	c.Status(code)
+	encoder := json.NewEncoder(c.Writer)
+	if err := encoder.Encode(obj); err != nil {
+		http.Error(c.Writer, err.Error(), 500)
+	}
+}
+
+func (c *Context) Data(code int, data []byte) {
+	c.Status(code)
+	c.Writer.Write(data)
+}
+
+func (c *Context) HTML(code int, html string) {
+	c.SetHeader("Content-Type", "text/html")
+	c.Status(code)
+	c.Writer.Write([]byte(html))
+}
+
+```
+
+`gee.go`
+
+```go
+package gee
+
+import (
+	"log"
+	"net/http"
+)
+
+// HandlerFunc defines the request handler used by gee
+type HandlerFunc func(*Context)
+
+// Engine implement the interface of ServeHTTP
+type Engine struct {
+	router *router
+}
+
+// New is the constructor of gee.Engine
+func New() *Engine {
+	return &Engine{router: newRouter()}
+}
+
+func (engine *Engine) addRoute(method string, pattern string, handler HandlerFunc) {
+	log.Printf("Route %4s - %s", method, pattern)
+	engine.router.addRoute(method, pattern, handler)
+}
+
+// GET defines the method to add GET request
+func (engine *Engine) GET(pattern string, handler HandlerFunc) {
+	engine.addRoute("GET", pattern, handler)
+}
+
+// POST defines the method to add POST request
+func (engine *Engine) POST(pattern string, handler HandlerFunc) {
+	engine.addRoute("POST", pattern, handler)
+}
+
+// Run defines the method to start a http server
+func (engine *Engine) Run(addr string) (err error) {
+	return http.ListenAndServe(addr, engine)
+}
+
+func (engine *Engine) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	c := newContext(w, req)
+	engine.router.handle(c)
+}
+
+```
+
+`main.go`
+
+```go
+package main
+
+/*
+(1)
+$ curl -i http://localhost:9999/
+HTTP/1.1 200 OK
+Date: Mon, 12 Aug 2019 16:52:52 GMT
+Content-Length: 18
+Content-Type: text/html; charset=utf-8
+<h1>Hello Gee</h1>
+
+(2)
+$ curl "http://localhost:9999/hello?name=geektutu"
+hello geektutu, you're at /hello
+
+(3)
+$ curl "http://localhost:9999/hello/geektutu"
+hello geektutu, you're at /hello/geektutu
+
+(4)
+$ curl "http://localhost:9999/assets/css/geektutu.css"
+{"filepath":"css/geektutu.css"}
+
+(5)
+$ curl "http://localhost:9999/xxx"
+404 NOT FOUND: /xxx
+*/
+
+import (
+	"net/http"
+
+	"./gee"
+)
+
+func main() {
+	r := gee.New()
+	r.GET("/", func(c *gee.Context) {
+		c.HTML(http.StatusOK, "<h1>Hello Gee</h1>")
+	})
+
+	r.GET("/hello", func(c *gee.Context) {
+		// expect /hello?name=geektutu
+		c.String(http.StatusOK, "hello %s, you're at %s\n", c.Query("name"), c.Path)
+	})
+
+	r.GET("/hello/:name", func(c *gee.Context) {
+		// expect /hello/geektutu
+		c.String(http.StatusOK, "hello %s, you're at %s\n", c.Param("name"), c.Path)
+	})
+
+	r.GET("/assets/*filepath", func(c *gee.Context) {
+		c.JSON(http.StatusOK, gee.H{"filepath": c.Param("filepath")})
+	})
+
+	r.Run(":9999")
+}
+
+```
 
